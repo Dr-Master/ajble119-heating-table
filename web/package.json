@@ -1,0 +1,11 @@
+{
+  "name": "ajble119-heating-table-demo",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "AJBLE119 取暖桌智联 —— 本地 Web Bluetooth 控制 Demo（纯静态，无依赖）",
+  "scripts": {
+    "start": "python serve.py",
+    "test": "node test/protocol.test.mjs"
+  }
+}

@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#1f1f27">
+  <meta name="description" content="AJBLE119 取暖桌智联 · 本地 Web Bluetooth 控制台（纯静态、零依赖）">
+  <title>AJBLE119 取暖桌智联 · 网页控制台</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+  <div class="app">
+    <!-- ============================ 顶栏 ============================ -->
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">暖</span>
+        <div class="brand-text">
+          <span class="brand-title">取暖桌智联</span>
+          <span class="brand-model">AJBLE119 · Web Bluetooth</span>
+        </div>
+      </div>
+      <div class="conn-area">
+        <span id="device-name" class="device-name">--</span>
+        <span id="conn-status" class="badge badge-off">未连接</span>
+        <button id="btn-connect" class="btn btn-primary" type="button">连接设备</button>
+        <button id="btn-disconnect" class="btn btn-ghost" type="button" disabled>断开连接</button>
+      </div>
+    </header>
+
+    <div id="mode-hint" class="mode-hint" hidden>演示模式（模拟设备）</div>
+    <div id="notice" class="notice notice-info" role="status" hidden title="点击关闭"></div>
+
+    <main class="layout">
+      <!-- ========================= 状态概览 ========================= -->
+      <section class="card overview" aria-label="设备状态概览">
+        <div class="stat">
+          <span class="stat-label">当前温度</span>
+          <span class="stat-value"><span id="current-temp">--</span><span class="unit">℃</span></span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">电源</span>
+          <span class="stat-value"><span id="power-state">--</span></span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">定时</span>
+          <span class="stat-value mono" id="ov-timer">--</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">预约</span>
+          <span class="stat-value" id="ov-order">--</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">BLE 功率</span>
+          <span class="stat-value" id="ble-rate-label">--</span>
+        </div>
+      </section>
+
+      <!-- ========================= 电源 / 全控 ========================= -->
+      <section class="card" aria-labelledby="h-power">
+        <h2 id="h-power">电源 / 全控</h2>
+        <div class="power-row">
+          <button id="btn-power" class="btn btn-power" type="button" aria-pressed="false">开机</button>
+          <p class="hint">电源状态：<strong>请以「电源」状态为准</strong>。关机后设备仍可接收设置指令，但加热不会工作。</p>
+        </div>
+        <div class="divider"></div>
+        <div class="stepper">
+          <button id="btn-full-minus" class="btn btn-step" type="button" aria-label="全控减一档">−</button>
+          <div class="stepper-value"><span id="full-level">--</span><span class="unit">档</span></div>
+          <button id="btn-full-plus" class="btn btn-step" type="button" aria-label="全控加一档">＋</button>
+        </div>
+        <p class="hint">全控档位 0–5，＋/－ 每次 1 档；四区档位与全控互不自动同步。</p>
+      </section>
+
+      <!-- ========================= 四区加热 ========================= -->
+      <section class="card" aria-labelledby="h-zones">
+        <h2 id="h-zones">分区加热 <span class="sub">点击卡片循环 0 → 5 → 0</span></h2>
+        <div class="zones">
+          <button class="zone-card" type="button" data-zone="leftBehind" aria-label="左后加热，点击切换档位">
+            <span class="zone-name">左后</span>
+            <span class="zone-level">--</span>
+            <span class="zone-unit">档</span>
+          </button>
+          <button class="zone-card" type="button" data-zone="leftFront" aria-label="左前加热，点击切换档位">
+            <span class="zone-name">左前</span>
+            <span class="zone-level">--</span>
+            <span class="zone-unit">档</span>
+          </button>
+          <button class="zone-card" type="button" data-zone="rightBehind" aria-label="右后加热，点击切换档位">
+            <span class="zone-name">右后</span>
+            <span class="zone-level">--</span>
+            <span class="zone-unit">档</span>
+          </button>
+          <button class="zone-card" type="button" data-zone="rightFront" aria-label="右前加热，点击切换档位">
+            <span class="zone-name">右前</span>
+            <span class="zone-level">--</span>
+            <span class="zone-unit">档</span>
+          </button>
+        </div>
+        <p class="hint">原小程序中切换任一加热区会退出恒温模式（本页仅按设备回报显示，不自行改本地恒温）。</p>
+      </section>
+
+      <!-- ========================= 恒温 ========================= -->
+      <section class="card" aria-labelledby="h-const">
+        <h2 id="h-const">恒温</h2>
+        <div class="stepper">
+          <button id="btn-const-minus" class="btn btn-step" type="button" aria-label="恒温降 10 度">−</button>
+          <div class="stepper-value"><span id="const-value">--</span><span class="unit">℃</span></div>
+          <button id="btn-const-plus" class="btn btn-step" type="button" aria-label="恒温升 10 度">＋</button>
+        </div>
+        <p class="hint">恒温 40–80 ℃，步进 10 ℃；设备回报 0 表示恒温关闭（显示为「关」）。</p>
+      </section>
+
+      <!-- ========================= 脚暖 ========================= -->
+      <section class="card" aria-labelledby="h-foot">
+        <h2 id="h-foot">脚暖</h2>
+        <div class="foot-row">
+          <button id="btn-foot" class="btn btn-wide" type="button">切换脚暖档位</button>
+          <div class="readout">当前 <span id="foot-value" class="readout-num">--</span><span class="unit">档</span></div>
+        </div>
+        <p class="hint">脚暖 0–2 档循环，每次点击 +1。</p>
+      </section>
+
+      <!-- ========================= 定时 ========================= -->
+      <section class="card" aria-labelledby="h-timer">
+        <h2 id="h-timer">定时</h2>
+        <div class="row">
+          <label class="field">
+            <span class="field-label">定时时长（00:00–04:59）</span>
+            <input id="timer-input" type="time" min="00:00" max="04:59" step="60" value="00:30">
+          </label>
+          <div class="readout readout-block">设备回报<br><span id="timer-value" class="mono readout-num">--</span></div>
+        </div>
+        <div class="btn-row">
+          <button id="btn-timer-set" class="btn btn-primary" type="button">设置定时</button>
+          <button id="btn-timer-cancel" class="btn" type="button">取消定时</button>
+        </div>
+        <p class="hint">定时最长 4 小时 59 分（原小程序 picker 限制 00:00–04:59）。</p>
+      </section>
+
+      <!-- ========================= 预约 ========================= -->
+      <section class="card" aria-labelledby="h-order">
+        <h2 id="h-order">预约</h2>
+        <div class="row">
+          <label class="field">
+            <span class="field-label">日期</span>
+            <select id="order-day">
+              <option value="1">今天</option>
+              <option value="2">明天</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field-label">时间</span>
+            <input id="order-time" type="time" value="09:30">
+          </label>
+          <label class="field">
+            <span class="field-label">温度</span>
+            <select id="order-temp">
+              <option value="40">40 ℃</option>
+              <option value="50">50 ℃</option>
+              <option value="60" selected>60 ℃</option>
+              <option value="70">70 ℃</option>
+              <option value="80">80 ℃</option>
+            </select>
+          </label>
+        </div>
+        <div class="readout readout-block">当前预约：<span id="order-value" class="readout-num">--</span></div>
+        <div class="btn-row">
+          <button id="btn-order-set" class="btn btn-primary" type="button">设置预约</button>
+          <button id="btn-order-cancel" class="btn" type="button">取消预约</button>
+        </div>
+        <p class="hint">预约帧中的倒计时偏差由协议层按本地当前时刻实时计算。</p>
+      </section>
+
+      <!-- ========================= 其他设置 ========================= -->
+      <section class="card settings-card" aria-labelledby="h-settings">
+        <h2 id="h-settings">其他设置</h2>
+        <div class="row">
+          <label class="field">
+            <span class="field-label">提示音</span>
+            <select id="voice-select">
+              <option value="" disabled selected>--</option>
+              <option value="0">静音</option>
+              <option value="1">滴滴</option>
+              <option value="2">语音</option>
+            </select>
+          </label>
+          <div class="field">
+            <span class="field-label">BLE 发射功率</span>
+            <div class="rate-radio" role="radiogroup" aria-label="BLE 发射功率">
+              <label class="radio-pill"><input type="radio" name="ble-rate" value="1"><span>最低</span></label>
+              <label class="radio-pill"><input type="radio" name="ble-rate" value="5"><span>中等</span></label>
+              <label class="radio-pill"><input type="radio" name="ble-rate" value="9"><span>最高</span></label>
+            </div>
+          </div>
+        </div>
+        <div class="volume-row">
+          <label class="field volume-field">
+            <span class="field-label">音量 <span id="volume-value" class="mono readout-num">--</span><span class="unit">/100</span></span>
+            <input id="volume-input" type="range" min="0" max="100" step="1" value="60">
+          </label>
+          <button id="btn-volume-set" class="btn btn-primary" type="button">设置音量</button>
+        </div>
+        <p class="hint">提示音切换后立即发送；音量拖动后点「设置音量」生效。</p>
+      </section>
+
+      <!-- ==================== 高级 / 兼容排查 ==================== -->
+      <section class="card advanced-card" aria-labelledby="h-advanced">
+        <h2 id="h-advanced">高级 / 兼容排查 <span class="sub">真机按键无效时用</span></h2>
+        <details class="advanced">
+          <summary>展开特征清单与写入参数</summary>
+          <div class="row">
+            <label class="field">
+              <span class="field-label">写入目标</span>
+              <select id="adv-write-target">
+                <option value="auto" selected>自动（优先第 2 个特征，同小程序）</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field-label">写入方式</span>
+              <select id="adv-write-mode">
+                <option value="auto" selected>自动（带响应优先，失败降级）</option>
+                <option value="response">只用「带响应」写入</option>
+                <option value="noresponse">只用「无响应」写入</option>
+                <option value="legacy">只用旧版 writeValue</option>
+              </select>
+            </label>
+          </div>
+          <div class="row">
+            <label class="field">
+              <span class="field-label">每条指令重发次数</span>
+              <input id="adv-repeat" type="number" min="1" max="10" step="1" value="1">
+            </label>
+            <label class="field">
+              <span class="field-label">重发间隔（ms）</span>
+              <input id="adv-gap" type="number" min="0" max="1000" step="10" value="80">
+            </label>
+          </div>
+          <label class="checkbox">
+            <input id="adv-fanout" type="checkbox">
+            <span>同时写入该服务下的所有可写特征（排查"写错特征"用）</span>
+          </label>
+          <div class="raw-row">
+            <label class="field raw-field">
+              <span class="field-label">原始指令（hex，可含空格）</span>
+              <input id="raw-hex" type="text" placeholder="例如 A5 5A 00 00 00 00 00 FF FB" spellcheck="false">
+            </label>
+            <button id="btn-raw-send" class="btn" type="button">发送原始帧</button>
+          </div>
+          <div id="chars-table" class="chars-table" aria-live="polite"></div>
+          <p class="hint">
+            这些参数只影响浏览器侧的写入行为，不改变协议帧内容。连接成功后这里会列出设备全部特征；
+            若「开机」等按键无反应，可先勾选"同时写入所有可写特征"重试，或改用另一种写入方式。
+          </p>
+        </details>
+      </section>
+
+      <!-- ========================= 连接与日志 ========================= -->
+      <section class="card log-card" aria-labelledby="h-log">
+        <h2 id="h-log">连接与日志 <span class="sub">最多保留 200 行</span></h2>
+        <div class="log-toolbar">
+          <button id="btn-query" class="btn" type="button">查询状态</button>
+          <label class="checkbox">
+            <input id="auto-sync" type="checkbox" checked>
+            <span>发指令后 350ms 自动查询</span>
+          </label>
+          <button id="btn-clear-log" class="btn btn-ghost" type="button">清空日志</button>
+        </div>
+        <div id="log" class="log" role="log" aria-live="polite" aria-label="通信日志"></div>
+        <p class="hint">
+          TX = 发往下位机，RX = 下位机回报。状态帧为 22 字节（44 个 hex 字符），可能被拆成多段通知，由传输层重组。
+          演示模式下模拟器每 12 次控制指令（自动查询帧不计入）会模拟一次下位机请求断开（A5 5D），用于验证异常路径。
+        </p>
+      </section>
+    </main>
+
+    <footer class="footer">
+      仅用于本人自有设备的本地调试 · 协议来自小程序解包分析 · 请遵守当地法律法规与设备安全规范
+    </footer>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

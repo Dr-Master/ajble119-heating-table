@@ -1,0 +1,12 @@
+# ESPHome 本地密钥（包含 WiFi 密码与 API 加密密钥，绝对不要提交）
+esphome/secrets.yaml
+
+# Python
+__pycache__/
+*.pyc
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

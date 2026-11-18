@@ -1,0 +1,637 @@
+# AJBLE119「取暖桌智联」→ Home Assistant 网关固件（单文件，零 include，只需再加一个 secrets.yaml）
+# 用法、怎么取参数、刷机与排障：见同目录 README.md（§3 拿参数 / §4 填参数刷机 / §6 排障）
+
+substitutions:
+  dev_name: heating-table
+  friendly: 电暖桌桥接
+
+  # ── 必填三项（现在还是占位符，不改成你自己的设备就连接失败）──────────────
+  #   MAC：手机蓝牙 App 扫描列表里 AJBLE119 那条后面的地址，例 AE:07:3E:FC:CC:2A
+  #   特征：连接后「服务」页展开，Notify 填 chr_notify、Write 填 chr_write（通常只差最后一位）
+  ble_mac: "填你电暖桌的MAC"
+  chr_notify: "填你电暖桌的Notify"
+  chr_write: "填你电暖桌的Write"
+  svc_uuid: "EDFEC62E-9910-0BAC-5241-D8BDA6932A2F" #不用动，这是AJBLE119的标识符。
+
+  # ── 行为参数 ─────────────────────────────────────────────────────────────
+  query_interval: "10s"
+  resend_count: "2"
+  resend_gap_ms: "80"
+
+esphome:
+  name: ${dev_name}
+  friendly_name: ${friendly}
+  # 子设备：让「定时 / 预约」成为独立 HA 设备（设备页、自动概览各一张卡）；改 name 会改实体 id 前缀，需重刷
+  devices:
+    - id: dev_timer
+      name: "电暖桌 定时预约"
+
+esp32:
+  # ── 换板子只改这一段：variant 必须与芯片一致（esp32 / esp32s3 / esp32c3 / esp32c6 …）
+  # 只能用 ESP32 家族（BLE 组件要求）；选型与 WiFi+BLE 共存配置见 README §7
+  variant: esp32
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+  logs:
+    # 排障时把下面两行临时改 DEBUG，能看到「特征找不到 / 不允许写」的具体原因（见 README 排障）
+    ble_write_action: INFO
+    ble_client: INFO
+    esp32_ble_client: INFO
+    esp32_ble_tracker: WARN
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_pw
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${dev_name}-fallback"
+    password: "12345678"
+
+time:
+  # 预约要算 dayOff/minOff 偏移，必须有当前时间：HA 优先，SNTP 兜底（时区错→偏移错）
+  - platform: homeassistant
+    id: ha_time
+  - platform: sntp
+    id: sntp_time
+    timezone: Asia/Shanghai      # 缺省是 UTC，会让预约偏移算错
+
+captive_portal:
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+
+ble_client:
+  - mac_address: ${ble_mac}
+    id: table
+    auto_connect: true
+    on_connect:
+      then:
+        - lambda: |-
+            id(ble_up) = true;
+            ESP_LOGI("table", "电暖桌已连接");
+        - delay: 1s
+        - script.execute: tbl_query
+    on_disconnect:
+      then:
+        - lambda: |-
+            id(ble_up) = false;
+            ESP_LOGW("table", "电暖桌断开，等待自动重连");
+        - script.stop: tbl_flush      # 断开时清掉可能卡住的发送链
+
+globals:
+  - id: rx_buf
+    type: std::vector<uint8_t>
+  - id: st
+    type: std::vector<uint8_t>
+  - id: tx_frame
+    type: std::vector<uint8_t>
+  - id: ble_up
+    type: bool
+    initial_value: "false"
+  - id: rx_frames
+    type: int
+    initial_value: "0"
+  # ---- 预约 / 定时 的暂存参数（改实体时写入这里，点「应用…」按钮才下发）----
+  - id: g_order_day          # 0=取消 1=今天 2=明天
+    type: int
+    initial_value: "2"
+  - id: g_order_hour
+    type: int
+    initial_value: "9"
+  - id: g_order_min
+    type: int
+    initial_value: "30"
+  - id: g_order_temp
+    type: int
+    initial_value: "60"
+  - id: g_timer_hour
+    type: int
+    initial_value: "0"
+  - id: g_timer_min
+    type: int
+    initial_value: "0"
+
+script:
+  # 发送 id(tx_frame)，按 resend_count 次重发
+  - id: tbl_flush
+    # ⚠ 别用 mode: queued：会静默丢命令（max_runs=0）；restart 保证每次点击都真发一帧
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: "return id(ble_up);"
+          then:
+            - repeat:
+                count: ${resend_count}
+                then:
+                  - lambda: |-
+                      std::string s;
+                      char b[4];
+                      for (auto c : id(tx_frame)) { snprintf(b, sizeof(b), "%02X ", c); s += b; }
+                      ESP_LOGI("table", "TX(%u): %s", (unsigned) id(tx_frame).size(), s.c_str());
+                  - ble_client.ble_write:
+                      id: table
+                      service_uuid: ${svc_uuid}
+                      characteristic_uuid: ${chr_write}
+                      value: !lambda "return id(tx_frame);"
+                  - delay: ${resend_gap_ms}ms
+          else:
+            - logger.log:
+                level: WARN
+                format: "BLE 未连接，指令已丢弃（等重连后再点一次）"
+
+  - id: tbl_query
+    then:
+      - lambda: |-
+          id(tx_frame) = {0xA5, 0x5B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFB};
+      - script.execute: tbl_flush
+
+interval:
+  - interval: ${query_interval}
+    then:
+      - if:
+          condition:
+            lambda: "return id(ble_up);"
+          then:
+            - script.execute: tbl_query
+
+binary_sensor:
+  - platform: template
+    id: bs_conn
+    name: "连接状态 LINK"
+    device_class: connectivity
+    lambda: "return id(ble_up);"
+
+button:
+  - platform: template
+    name: "刷新状态 REFRESH"
+    icon: "mdi:refresh"
+    on_press:
+      - script.execute: tbl_query
+  # ===== 预约 / 定时：写入按钮（参数见下方 number 实体）=====
+  - platform: template
+    id: btn_order_apply
+    device_id: dev_timer
+    name: "应用预约 APPLYORDER"
+    icon: "mdi:calendar-check"
+    on_press:
+      - lambda: |-
+          auto t = id(ha_time).now();
+          if (!t.is_valid())
+            t = id(sntp_time).now();
+          if (!t.is_valid()) {
+            ESP_LOGW("table", "时间未同步（HA/SNTP 都无效），跳过下发预约");
+            return;
+          }
+          const int day = id(g_order_day);      // 0=取消 1=今天 2=明天
+          const int h = id(g_order_hour);
+          const int m = id(g_order_min);
+          const int temp = id(g_order_temp);
+          const int now_h = t.hour, now_m = t.minute;
+          // 逐条照抄小程序 AJBLE119.js getOrderControlCode() 的分支（含其"今天且时刻已过"的怪癖）
+          int day_off = 0, min_off = 0;
+          if (day == 1) {
+            if (now_h == h) { day_off = 0; min_off = m - now_m; }
+            else if (h - now_h == 1 && m >= now_m) { day_off = 1; min_off = m - now_m; }
+            else if (h - now_h == 1 && m < now_m) { day_off = 0; min_off = 60 - now_m + m; }
+            else if (h - now_h > 1 && m >= now_m) { day_off = h - now_h; min_off = m - now_m; }
+            else if (h - now_h > 1 && m < now_m) { day_off = h - now_h - 1; min_off = 60 - now_m + m; }
+          } else if (day == 2) {
+            if (now_m < m) { min_off = m - now_m; day_off = 24 - now_h + h; }
+            else if (now_m > m) { day_off = 23 - now_h + h; min_off = (h == 0 && m == 0) ? 60 - now_m : m - now_m; }
+            else { min_off = 0; day_off = 24 - now_h + h; }
+          }
+          // 15 字节：A5 5E day HH MM temp 00 00 00 dayOff minOff 00 00 00 FB（无校验字节）
+          id(tx_frame) = {
+            0xA5, 0x5E, (uint8_t) day, (uint8_t) h, (uint8_t) m, (uint8_t) temp,
+            0, 0, 0,
+            (uint8_t) (day_off & 0xFF), (uint8_t) (min_off & 0xFF),
+            0, 0, 0, 0xFB
+          };
+          ESP_LOGI("table", "预约: day=%d %02d:%02d %dC -> dayOff=%d minOff=%d (现在 %02d:%02d)",
+                   day, h, m, temp, day_off, min_off, now_h, now_m);
+      - script.execute: tbl_flush
+  - platform: template
+    id: btn_order_cancel
+    device_id: dev_timer
+    name: "取消预约 CANCELORDER"
+    icon: "mdi:calendar-remove"
+    on_press:
+      - lambda: |-
+          id(tx_frame) = {0xA5, 0x5E, 0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0xFB};
+          ESP_LOGI("table", "取消预约（全 0 帧）");
+      - script.execute: tbl_flush
+  - platform: template
+    id: btn_timer_apply
+    device_id: dev_timer
+    name: "应用定时 APPLYTIMER"
+    icon: "mdi:timer-check"
+    on_press:
+      - lambda: |-
+          const int h = id(g_timer_hour);
+          const int m = id(g_timer_min);
+          const uint8_t chk = (uint8_t) ((0xFF + 0x0A + h + m) & 0xFF);
+          id(tx_frame) = {0xA5, 0x5A, 0x00, 0x0A, 0x00, (uint8_t) h, (uint8_t) m, chk, 0xFB};
+          ESP_LOGI("table", "定时: %02d:%02d (CHK=0x%02X)", h, m, chk);
+      - script.execute: tbl_flush
+  - platform: template
+    id: btn_timer_cancel
+    device_id: dev_timer
+    name: "取消定时 CANCELTIMER"
+    icon: "mdi:timer-off"
+    on_press:
+      - lambda: |-
+          id(tx_frame) = {0xA5, 0x5A, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x09, 0xFB};
+          ESP_LOGI("table", "取消定时");
+      - script.execute: tbl_flush
+
+switch:
+  - platform: template
+    id: sw_power
+    name: "电源 POWER"
+    icon: "mdi:power"
+    optimistic: false
+    lambda: |-
+      if (id(st).size() < 22) return false;
+      return id(st)[2] != 0;
+    turn_on_action:
+      - lambda: |-
+          id(tx_frame) = {0xA5, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFB};
+      - script.execute: tbl_flush
+    turn_off_action:
+      - lambda: |-
+          id(tx_frame) = {0xA5, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0xFB};
+      - script.execute: tbl_flush
+
+select:
+  # 恒温：0=关，有效 30~80
+  - platform: template
+    id: sel_const
+    name: "恒温温度 TEMP"
+    icon: "mdi:thermometer"
+    options: ["关", "30", "40", "50", "60", "70", "80"]
+    lambda: |-
+      if (id(st).size() < 22) return std::string("关");
+      uint8_t t = id(st)[3];
+      if (t == 0) return std::string("关");
+      return std::to_string(static_cast<unsigned>(t));
+    set_action:
+      - lambda: |-
+          uint8_t t = 0;
+          if (x != "关") t = static_cast<uint8_t>(atoi(x.c_str()));
+          uint8_t chk = static_cast<uint8_t>(0xFF + 0x01 + t);
+          id(tx_frame) = {0xA5, 0x5A, 0x00, 0x01, 0x00, 0x00, t, chk, 0xFB};
+      - script.execute: tbl_flush
+
+  - platform: template
+    id: sel_mode
+    name: "全控档位 LEVEL"
+    icon: "mdi:radiator"
+    options: ["0", "1", "2", "3", "4", "5"]
+    lambda: |-
+      if (id(st).size() < 22) return std::string("0");
+      return std::to_string(static_cast<unsigned>(id(st)[4]));
+    set_action:
+      - lambda: |-
+          uint8_t l = static_cast<uint8_t>(atoi(x.c_str()));
+          uint8_t chk = static_cast<uint8_t>(0xFF + 0x02 + l);
+          id(tx_frame) = {0xA5, 0x5A, 0x00, 0x02, 0x00, 0x00, l, chk, 0xFB};
+      - script.execute: tbl_flush
+
+  - platform: template
+    id: sel_lf
+    name: "左前加热 LF"
+    icon: "mdi:radiator"
+    options: ["0", "1", "2", "3", "4", "5"]
+    lambda: |-
+      if (id(st).size() < 22) return std::string("0");
+      return std::to_string(static_cast<unsigned>(id(st)[5]));
+    set_action:
+      - lambda: |-
+          uint8_t l = static_cast<uint8_t>(atoi(x.c_str()));
+          uint8_t chk = static_cast<uint8_t>(0xFF + 0x05 + l);
+          id(tx_frame) = {0xA5, 0x5A, 0x00, 0x05, 0x00, 0x00, l, chk, 0xFB};
+      - script.execute: tbl_flush
+
+  - platform: template
+    id: sel_lb
+    name: "左后加热 LB"
+    icon: "mdi:radiator"
+    options: ["0", "1", "2", "3", "4", "5"]
+    lambda: |-
+      if (id(st).size() < 22) return std::string("0");
+      return std::to_string(static_cast<unsigned>(id(st)[6]));
+    set_action:
+      - lambda: |-
+          uint8_t l = static_cast<uint8_t>(atoi(x.c_str()));
+          uint8_t chk = static_cast<uint8_t>(0xFF + 0x06 + l);
+          id(tx_frame) = {0xA5, 0x5A, 0x00, 0x06, 0x00, 0x00, l, chk, 0xFB};
+      - script.execute: tbl_flush
+
+  - platform: template
+    id: sel_rf
+    name: "右前加热 RF"
+    icon: "mdi:radiator"
+    options: ["0", "1", "2", "3", "4", "5"]
+    lambda: |-
+      if (id(st).size() < 22) return std::string("0");
+      return std::to_string(static_cast<unsigned>(id(st)[7]));
+    set_action:
+      - lambda: |-
+          uint8_t l = static_cast<uint8_t>(atoi(x.c_str()));
+          uint8_t chk = static_cast<uint8_t>(0xFF + 0x03 + l);
+          id(tx_frame) = {0xA5, 0x5A, 0x00, 0x03, 0x00, 0x00, l, chk, 0xFB};
+      - script.execute: tbl_flush
+
+  - platform: template
+    id: sel_rb
+    name: "右后加热 RB"
+    icon: "mdi:radiator"
+    options: ["0", "1", "2", "3", "4", "5"]
+    lambda: |-
+      if (id(st).size() < 22) return std::string("0");
+      return std::to_string(static_cast<unsigned>(id(st)[8]));
+    set_action:
+      - lambda: |-
+          uint8_t l = static_cast<uint8_t>(atoi(x.c_str()));
+          uint8_t chk = static_cast<uint8_t>(0xFF + 0x04 + l);
+          id(tx_frame) = {0xA5, 0x5A, 0x00, 0x04, 0x00, 0x00, l, chk, 0xFB};
+      - script.execute: tbl_flush
+
+  - platform: template
+    id: sel_foot
+    name: "脚暖 FOOT"
+    icon: "mdi:shoe-print"
+    options: ["0", "1", "2"]
+    lambda: |-
+      if (id(st).size() < 22) return std::string("0");
+      return std::to_string(static_cast<unsigned>(id(st)[9]));
+    set_action:
+      - lambda: |-
+          uint8_t l = static_cast<uint8_t>(atoi(x.c_str()));
+          uint8_t chk = static_cast<uint8_t>(0xFF + 0x07 + l);
+          id(tx_frame) = {0xA5, 0x5A, 0x00, 0x07, 0x00, 0x00, l, chk, 0xFB};
+      - script.execute: tbl_flush
+
+  # 提示音：0 静音 / 1 滴滴 / 2 语音
+  - platform: template
+    id: sel_sound
+    name: "提示音 SOUND"
+    icon: "mdi:volume-high"
+    options: ["0", "1", "2"]
+    lambda: |-
+      if (id(st).size() < 22) return std::string("0");
+      return std::to_string(static_cast<unsigned>(id(st)[10]));
+    set_action:
+      - lambda: |-
+          uint8_t v = static_cast<uint8_t>(atoi(x.c_str()));
+          uint8_t chk = static_cast<uint8_t>(0xFF + 0x09 + v);
+          id(tx_frame) = {0xA5, 0x5A, 0x00, 0x09, 0x00, 0x00, v, chk, 0xFB};
+      - script.execute: tbl_flush
+
+number:
+  # ===== 预约 / 定时 的参数 =====
+  - platform: template
+    id: num_order_day
+    device_id: dev_timer
+    name: "预约日(0关1今2明) ORDERDAY"
+    icon: "mdi:calendar"
+    optimistic: true
+    min_value: 0
+    max_value: 2
+    step: 1
+    initial_value: 2
+    set_action:
+      - lambda: id(g_order_day) = (int) x;
+  - platform: template
+    id: num_order_hour
+    device_id: dev_timer
+    name: "预约时 ORDERHOUR"
+    icon: "mdi:clock-outline"
+    optimistic: true
+    min_value: 0
+    max_value: 23
+    step: 1
+    initial_value: 9
+    set_action:
+      - lambda: id(g_order_hour) = (int) x;
+  - platform: template
+    id: num_order_min
+    device_id: dev_timer
+    name: "预约分 ORDERMIN"
+    icon: "mdi:clock-outline"
+    optimistic: true
+    min_value: 0
+    max_value: 59
+    step: 1
+    initial_value: 30
+    set_action:
+      - lambda: id(g_order_min) = (int) x;
+  - platform: template
+    id: num_order_temp
+    device_id: dev_timer
+    name: "预约温度 ORDERTEMP"
+    icon: "mdi:thermometer"
+    optimistic: true
+    min_value: 40
+    max_value: 80
+    step: 10
+    initial_value: 60
+    set_action:
+      - lambda: id(g_order_temp) = (int) x;
+  - platform: template
+    id: num_timer_hour
+    device_id: dev_timer
+    name: "定时时 TIMERHOUR"
+    icon: "mdi:timer-outline"
+    optimistic: true
+    min_value: 0
+    max_value: 4
+    step: 1
+    initial_value: 0
+    set_action:
+      - lambda: id(g_timer_hour) = (int) x;
+  - platform: template
+    id: num_timer_min
+    device_id: dev_timer
+    name: "定时分 TIMERMIN"
+    icon: "mdi:timer-outline"
+    optimistic: true
+    min_value: 0
+    max_value: 59
+    step: 1
+    initial_value: 0
+    set_action:
+      - lambda: id(g_timer_min) = (int) x;
+  # 音量：0~100，放在 p1 下发
+  - platform: template
+    id: num_vol
+    name: "音量 VOLUME"
+    icon: "mdi:volume-medium"
+    min_value: 0
+    max_value: 100
+    step: 5
+    lambda: |-
+      if (id(st).size() < 22) return 0.0f;
+      return static_cast<float>(id(st)[20]);
+    set_action:
+      - lambda: |-
+          uint8_t v = static_cast<uint8_t>(x);
+          uint8_t chk = static_cast<uint8_t>(0xFF + 0x0E + v);
+          id(tx_frame) = {0xA5, 0x5A, 0x00, 0x0E, v, 0x00, 0x00, chk, 0xFB};
+      - script.execute: tbl_flush
+
+sensor:
+  - platform: template
+    id: sen_current
+    name: "当前温度 CUR"
+    unit_of_measurement: "℃"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      if (id(st).size() < 22) return 0.0f;
+      return static_cast<float>(id(st)[18]);
+
+  - platform: template
+    id: sen_blepow
+    name: "BLE 发射功率 BLEPWR"
+    icon: "mdi:signal"
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      if (id(st).size() < 22) return 0.0f;
+      return static_cast<float>(id(st)[19]);
+
+  - platform: template
+    id: sen_rx_frames
+    name: "已接收状态帧数 RX"
+    icon: "mdi:counter"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: "return static_cast<float>(id(rx_frames));"
+
+# 收通知：分片重组 + 解析 + 回填实体（模板 text_sensor 先声明，ble_client 通知块放最后）
+text_sensor:
+  - platform: template
+    id: txt_timer
+    device_id: dev_timer
+    name: "定时 TIMER"
+    icon: "mdi:timer-outline"
+    update_interval: 5s
+    lambda: |-
+      if (id(st).size() < 22) return std::string("");
+      char b[16];
+      snprintf(b, sizeof(b), "%02u:%02u:%02u", static_cast<unsigned>(id(st)[11]),
+               static_cast<unsigned>(id(st)[12]), static_cast<unsigned>(id(st)[13]));
+      return std::string(b);
+
+  - platform: template
+    id: txt_order
+    device_id: dev_timer
+    name: "预约 ORDER"
+    icon: "mdi:calendar-clock"
+    update_interval: 5s
+    lambda: |-
+      if (id(st).size() < 22) return std::string("");
+      if (id(st)[14] == 0 || id(st)[17] == 0) return std::string("无");
+      char b[40];
+      snprintf(b, sizeof(b), "%s %02u:%02u %u℃", id(st)[14] == 2 ? "明天" : "今天",
+               static_cast<unsigned>(id(st)[15]), static_cast<unsigned>(id(st)[16]),
+               static_cast<unsigned>(id(st)[17]));
+      return std::string(b);
+  - platform: ble_client
+    ble_client_id: table
+    id: table_notify
+    internal: true
+    service_uuid: ${svc_uuid}
+    characteristic_uuid: ${chr_notify}
+    notify: true
+    update_interval: 30min
+    on_notify:
+      - lambda: |-
+          auto &buf = id(rx_buf);
+          for (std::size_t i = 0; i < x.size(); i++) {
+            buf.push_back(static_cast<uint8_t>(static_cast<unsigned char>(x[i])));
+          }
+
+          while (buf.size() >= 2) {
+            if (buf[0] != 0xA5) {
+              buf.erase(buf.begin());
+              continue;
+            }
+            std::size_t need = 0;
+            if (buf[1] == 0x5C) {
+              need = 22;
+            } else if (buf[1] == 0x5D || buf[1] == 0x5B) {
+              need = 9;
+            } else {
+              buf.erase(buf.begin());
+              continue;
+            }
+            if (buf.size() < need) break;
+
+            std::vector<uint8_t> f(buf.begin(), buf.begin() + need);
+            buf.erase(buf.begin(), buf.begin() + need);
+
+            if (f[1] == 0x5C) {
+              id(st) = f;
+              id(rx_frames) = id(rx_frames) + 1;
+
+              id(bs_conn).publish_state(true);
+              id(sw_power).publish_state(f[2] != 0);
+              id(sel_const).publish_state(f[3] == 0 ? std::string("关")
+                                                    : std::to_string(static_cast<unsigned>(f[3])));
+              id(sel_mode).publish_state(std::to_string(static_cast<unsigned>(f[4])));
+              id(sel_lf).publish_state(std::to_string(static_cast<unsigned>(f[5])));
+              id(sel_lb).publish_state(std::to_string(static_cast<unsigned>(f[6])));
+              id(sel_rf).publish_state(std::to_string(static_cast<unsigned>(f[7])));
+              id(sel_rb).publish_state(std::to_string(static_cast<unsigned>(f[8])));
+              id(sel_foot).publish_state(std::to_string(static_cast<unsigned>(f[9])));
+              id(sel_sound).publish_state(std::to_string(static_cast<unsigned>(f[10])));
+              id(num_vol).publish_state(static_cast<float>(f[20]));
+              id(sen_current).publish_state(static_cast<float>(f[18]));
+              id(sen_blepow).publish_state(static_cast<float>(f[19]));
+
+              // 定时 "HH:MM:SS"
+              {
+                char b[16];
+                snprintf(b, sizeof(b), "%02u:%02u:%02u", static_cast<unsigned>(f[11]),
+                         static_cast<unsigned>(f[12]), static_cast<unsigned>(f[13]));
+                id(txt_timer).publish_state(std::string(b));
+              }
+              // 预约 "今天/明天 HH:MM NN℃"
+              {
+                char b[40];
+                if (f[14] == 0 || f[17] == 0) {
+                  id(txt_order).publish_state(std::string("无"));
+                } else {
+                  snprintf(b, sizeof(b), "%s %02u:%02u %u℃", f[14] == 2 ? "明天" : "今天",
+                           static_cast<unsigned>(f[15]), static_cast<unsigned>(f[16]),
+                           static_cast<unsigned>(f[17]));
+                  id(txt_order).publish_state(std::string(b));
+                }
+              }
+
+              ESP_LOGD("table",
+                       "状态: 电源=%u 恒温=%u 全控=%u 左前=%u 左后=%u 右前=%u 右后=%u 脚暖=%u 音效=%u 当前=%u 音量=%u",
+                       f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[18], f[20]);
+            } else if (f[1] == 0x5D) {
+              ESP_LOGW("table", "设备请求断开连接，等待自动重连");
+              id(ble_up) = false;
+              id(bs_conn).publish_state(false);
+            }
+          }
