@@ -82,11 +82,10 @@
 
 ## 来源
 
-原厂控制端是微信小程序 **智联微控**（开发者：广州安聚物联网科技有限公司，标语「智慧物联，无需配网，方便快捷」）。
+原厂控制端是微信小程序 **智联微控**。
 
 <p>
   <img src="docs/miniprogram-logo.jpg" width="80" alt="智联微控 小程序图标">
-  <img src="docs/miniprogram-profile.jpg" width="260" alt="智联微控 小程序账号页">
 </p>
 
 协议取自该小程序 `pages/AJBLE119/` 的静态分析，不涉及账号、云端接口或加密绕过。
